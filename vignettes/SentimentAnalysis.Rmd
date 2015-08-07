@@ -34,7 +34,7 @@ This vignette uses FeatureHashing v9.0 and XGBoost v0.3-3.
 
 
 ```r
-library(FeatureHashing); library(Matrix); library(xgboost)
+library(FeatureHashing); library(Matrix); library(xgboost); library(magrittr)
 ```
 
 Basic data preparation
@@ -152,3 +152,100 @@ m2 <- xgb.train(data = dtrain, nrounds = 10, eta = 0.02,
 ```
 
 The above demonstration deliberately omits steps such as model tuning but hopefully it illustrates a useful workflow that makes the most of the FeatureHashing and XGBoost packages. 
+
+Comparing with Naive Bayes
+==========================
+
+Naive Bayes is a very simple algorithm. It is based on applying Bayes' theorem with strong (naive) *independence* assumptions between the features.
+
+Basically we will compute the probability of each feature regarding each label. Then, on a new text, we can apply the probabilities to guess the class.
+
+On Cran, there is not yet an implemetation dealing with sparse Matrix.
+
+Therefore we will build our own implementation.
+It is mainly about counting features.
+The first thing we want to do is to compute the probability of each word regarding its label.
+
+```r
+naive.bayes <- function(matrix.raw, labels, condition, Laplace = 0){
+  pos <- which(labels == condition)
+  matrix.pos <- matrix.raw[pos,] %>% colSums %>% add(Laplace) %>% {./sum(.)}
+  classProb <- length(pos) / length(labels)
+  matrix.pos * classProb
+}
+```
+
+In the function above:
+
+- matrix.raw: it is the hashed matrix;
+- labels: a vector containing the labels for each row;
+- conditions: our selected label;
+- Laplace: a smoothing parameter. It is useful when one word is never used in a class.
+
+Regarding the algorithm, on first line we get the row lines with the selected label. Then on the second line, se subset our selection from the hashed matrix and we count (`colSums`) the number of times each word appear in the label. Finally, we divide this count by the number of words (`sum`).
+In the last two lines, we compute the probability of having the selected label, and we apply it to the probability of having a word when we know the label.
+
+That's all for building the "model"!
+
+Second part is to apply the model to new data. For this part, we will use C++ code, otherwise it is to slow.
+
+Code is provided below.
+```C
+#include <Rcpp.h>
+using namespace Rcpp;
+
+
+// [[Rcpp::depends(RcppEigen)]]
+#include <RcppEigen.h>
+using namespace Rcpp;
+typedef Eigen::MappedSparseMatrix<double> MSpMat;
+typedef MSpMat::InnerIterator InIterMat;
+
+// [[Rcpp::export]]
+NumericVector logLik (MSpMat X, bool abs = false){
+  NumericVector result(X.rows());
+  double rowVal = 0;
+  for (int j=0; j<X.outerSize(); ++j){
+    for (InIterMat it(X,j); it; ++it)
+    {
+      rowVal = abs ? fabs(it.value()) : it.value();
+      if(rowVal > 0){ // Required for some unknown reason!
+        result[it.row()] += log(rowVal); 
+      }
+    }
+  }
+  
+  return result;
+}
+
+```
+
+Basically, we are applying our probabilities to new rows. The point is to avoid the `0`. And for that purpose we use an iterator of sparse matrix provided by the very good `Eigen` library.
+
+
+Now, let's try our little implementation.
+
+```r
+# Build the "model".
+r1 <- naive.bayes(d1[1:24000,], imdb$sentiment[1:24000], 1)
+r0 <- naive.bayes(d1[1:24000,], imdb$sentiment[1:24000], 0)
+
+# Compute log of the probability of having each label.
+logClass1 = log(sum(imdb$sentiment[1:24000] == 1) / nrow(imdb))
+logClass0 = log(sum(imdb$sentiment[1:24000] == 0) / nrow(imdb))
+
+# Apply the model to new data.
+class1 <- logLik(t(r1 * t(d1[24001:25000,])), abs = T) + logClass1
+class0 <- logLik(t(r0 * t(d1[24001:25000,])), abs = T) + logClass0
+
+# Compute average error rate
+mean((imdb$sentiment[24001:25000] == 1) != (class1 > class0))
+```
+
+That's all.
+
+You may wonder why we are using `log` everywhere instead of simple multiplication of probabilities?
+
+The idea is to avoid something call underflood error. When you multiply many small probabilities you may get a figure that small that it is automatically rounded by the system to 0. To avoid that, we transform the probabilities to `log` probabilities.
+
+This is a good workaround because `log` is monotically increasing, so comparing `P(a)` and `P(b)` is the same as comparing `log(P(a))` and `log(P(b))`. Then you can apply the rule `P(x*y) == P(x) + P(y)`.
